@@ -1,0 +1,178 @@
+#!/usr/bin/env node
+// vault — CLI к памяти (claude-vault + skills) для Claude и человека. Ходит в локальный сервер vault-app.
+//
+//   vault find <запрос…>         полнотекстовый поиск: заметка, строка, сниппет
+//   vault ls [фильтр]            список заметок: размер, свежесть, связи
+//   vault toc <name>             оглавление со статусами и датами (для больших журналов)
+//   vault show <name> [#часть]   заметка целиком или одна секция (по подстроке заголовка)
+//   vault links <name>           кто ссылается ← / на кого → / битые ✗
+//   vault recent [n]             недавно изменённые файлы
+//   vault issues                 большие, битые ссылки, одиночки, без frontmatter
+//   vault lint                   дисциплина: разбухшие «состояния», записи не в тот файл, забытые даты
+//   vault save [сообщение]       снимок памяти в git (перед опасной правкой — обязательно)
+//   vault open [name]            открыть в Firefox
+//   vault path <name>            абсолютный путь файла
+//
+//   Факты (одна сущность — одна запись; работают без сервера):
+//   vault fact set <id> status=… value=… src=… note=desk_… [by= since= title= tags= state= ttl= check= why=]
+//   vault fact ok <id> [src=… by=…]   подтвердить «всё так» без изменений (обновит «сверено»)
+//   vault fact get <id>               запись + последние события
+//   vault fact ls [фильтр] [--stale] [--state=wait] [--all]
+//   vault fact log <id>               таймлайн изменений
+//   vault fact ref <id>               строка для вставки в заметку: {{fact:id}} [[FACTS#id]]
+//   vault fact rm <id> [why=…]        в архив (история остаётся)
+//   vault verify [id…] [--dry]        сверка с источником (ssh/git/http — только чтение) + список давно не сверенных
+//   vault index --build               черновик короткого индекса MEMORY.next.md (≤ 10 КБ; MEMORY.md не трогает)
+'use strict';
+const { spawnSync } = require('child_process');
+const path = require('path');
+const os = require('os');
+
+const PORT = process.env.VAULT_PORT || 4040;
+const BASE = `http://127.0.0.1:${PORT}`;
+const CTL = path.join(__dirname, 'vaultctl');
+const ROOT_DIRS = { vault: process.env.VAULT_DIR || path.join(os.homedir(), 'claude-vault'), skills: process.env.SKILLS_DIR || path.join(os.homedir(), '.claude', 'skills') };
+const LIB = path.join(path.dirname(require('fs').realpathSync(__filename)), '..', 'lib');
+const facts = () => require(path.join(LIB, 'facts.js'));
+
+async function api(p) {
+  const r = await fetch(BASE + p);
+  if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+  return r.json();
+}
+async function ensureUp() {
+  try { await api('/api/rebuild'); return; } catch {}
+  // регистрируемся как сессия: vaultctl сам найдёт PID claude-предка, и сервер погаснет вместе с ним
+  spawnSync(CTL, ['hook-start'], { input: JSON.stringify({ session_id: 'cli-' + process.ppid }), stdio: ['pipe', 'ignore', 'ignore'] });
+  await new Promise(r => setTimeout(r, 800));
+}
+const fmtSize = b => b < 1024 ? b + 'B' : b < 1048576 ? (b / 1024).toFixed(b < 10240 ? 1 : 0) + 'K' : (b / 1048576).toFixed(1) + 'M';
+const ago = iso => { const s = (Date.now() - new Date(iso)) / 1000; if (s < 3600) return Math.max(1, s / 60 | 0) + 'м'; if (s < 86400) return (s / 3600 | 0) + 'ч'; if (s < 86400 * 30) return (s / 86400 | 0) + 'д'; return (s / 86400 / 30 | 0) + 'мес'; };
+const absPath = n => path.join(ROOT_DIRS[n.root], n.rel);
+const pad = (s, n) => String(s).padEnd(n).slice(0, n);
+const label = n => n.root === 'skills' ? 'skill:' + n.title : n.base;
+
+async function findNote(name) {
+  const t = await api('/api/tree');
+  const q = name.toLowerCase().replace(/\.md$/, '');
+  const exact = t.notes.find(n => n.base.toLowerCase() === q || n.name.toLowerCase() === q || n.id.toLowerCase() === q || (n.root === 'skills' && n.rel.split('/')[0].toLowerCase() === q));
+  if (exact) return exact;
+  const part = t.notes.filter(n => (n.base + ' ' + n.title).toLowerCase().includes(q));
+  if (part.length === 1) return part[0];
+  if (part.length > 1) { console.error('Уточни, нашлось несколько:'); part.forEach(n => console.error('  ' + n.base)); process.exit(2); }
+  console.error(`Нет заметки «${name}»`); process.exit(1);
+}
+
+const cmds = {
+  async find(args) {
+    const q = args.join(' ').trim(); if (!q) return usage();
+    const res = await api('/api/search?q=' + encodeURIComponent(q));
+    if (!res.length) return console.log('Ничего не найдено');
+    for (const r of res.slice(0, 25)) {
+      console.log(`\x1b[1m${label(r)}\x1b[0m  (${r.rel}, ${fmtSize(r.size)}, ${ago(r.mtime)} назад)`);
+      for (const s of r.snippets) console.log(`   :${s.line}  ${s.text.trim().slice(0, 160)}`);
+    }
+    if (res.length > 25) console.log(`… ещё ${res.length - 25}`);
+  },
+  async ls(args) {
+    const t = await api('/api/tree');
+    const f = args.join(' ').toLowerCase();
+    const list = t.notes.filter(n => !f || (n.base + ' ' + n.description + ' ' + n.rel).toLowerCase().includes(f)).sort((a, b) => a.id.localeCompare(b.id));
+    for (const n of list) console.log(`${pad(n.root === 'skills' ? 'skill' : n.folder, 14)} ${pad(label(n), 42)} ${pad(fmtSize(n.size), 6)} ${pad(ago(n.mtime), 5)} ←${n.in} →${n.out}${n.brokenCount ? ' ✗' + n.brokenCount : ''}  ${n.description.slice(0, 70)}`);
+    console.log(`\n${list.length} заметок`);
+  },
+  async toc(args) {
+    const n = await findNote(args[0] || '');
+    const full = await api('/api/note?id=' + encodeURIComponent(n.id));
+    console.log(`\x1b[1m${n.base}\x1b[0m  ${absPath(n)}  (${fmtSize(n.size)}, ${full.lines} строк)`);
+    if (n.description) console.log('  ' + n.description);
+    for (const h of full.headings) console.log(`  ${pad(':' + h.line, 6)} ${'  '.repeat(h.level - 1)}${h.text}`);
+  },
+  async show(args) {
+    const n = await findNote(args[0] || '');
+    const full = await api('/api/note?id=' + encodeURIComponent(n.id));
+    const sect = args.slice(1).join(' ').replace(/^#\s*/, '').toLowerCase();
+    if (!sect) return console.log(facts().expandRefs(full.raw));
+    const hs = full.headings; const i = hs.findIndex(h => h.text.toLowerCase().includes(sect));
+    if (i < 0) { console.error('Нет секции с таким заголовком. Смотри: vault toc ' + n.base); process.exit(1); }
+    let end = hs.length;
+    for (let j = i + 1; j < hs.length; j++) if (hs[j].level <= hs[i].level) { end = j; break; }
+    const lines = full.body.split('\n');
+    const from = hs[i].line - 1, to = end < hs.length ? hs[end].line - 1 : lines.length;
+    console.log(`# ${absPath(n)}:${hs[i].line}\n`);
+    console.log(facts().expandRefs(lines.slice(from, to).join('\n').trimEnd()));
+  },
+  async links(args) {
+    const n = await findNote(args[0] || '');
+    const full = await api('/api/note?id=' + encodeURIComponent(n.id));
+    console.log(`← ссылаются (${full.backlinks.length}):`); full.backlinks.forEach(x => console.log('   ' + label(x)));
+    console.log(`→ ссылается (${full.outlinks.length}):`); full.outlinks.forEach(x => console.log('   ' + label(x)));
+    if (full.broken.length) { console.log(`✗ битые (${full.broken.length}):`); full.broken.forEach(x => console.log('   [[' + x + ']]')); }
+  },
+  async recent(args) {
+    const t = await api('/api/tree');
+    const n = parseInt(args[0], 10) || 15;
+    t.notes.sort((a, b) => new Date(b.mtime) - new Date(a.mtime)).slice(0, n).forEach(x => console.log(`${pad(ago(x.mtime), 6)} ${pad(label(x), 44)} ${fmtSize(x.size)}`));
+  },
+  async issues() {
+    const t = await api('/api/tree');
+    const N = t.notes;
+    const grp = (title, arr, extra) => { if (!arr.length) return; console.log(`\n${title} (${arr.length}):`); arr.forEach(x => console.log('   ' + pad(label(x), 44) + (extra ? extra(x) : ''))); };
+    // журналы (*_log) большие ПО ЗАМЫСЛУ — их не ругаем, они и есть хранилище истории
+    grp('Слишком большие (>40K) — резать на «состояние» + «журнал»',
+        N.filter(x => x.size > 40000 && !x.base.endsWith('_log') && x.base !== 'FACTS').sort((a, b) => b.size - a.size),
+        x => fmtSize(x.size) + ', ' + x.headings + ' загол.');
+    grp('Битые [[ссылки]]', N.filter(x => x.brokenCount && x.root === 'vault'), x => '✗' + x.brokenCount);
+    grp('Одиночки (никто не ссылается)', N.filter(x => x.in === 0 && x.root === 'vault' && !x.base.startsWith('MEMORY')));
+    grp('Без frontmatter', N.filter(x => !x.hasFm));
+    try { const st = facts().list('', { stale: true }); if (st.length) console.log(`\nФакты, не сверявшиеся дольше срока (${st.length}): ${st.map(f => f.id).join(', ')}\n   → vault verify / vault fact ok <id>`); } catch {}
+  },
+  async lint() {
+    const t = await api('/api/tree');
+    const N = t.notes.filter(n => n.root === 'vault');
+    const say = (title, arr, fmt) => { if (!arr.length) return 0; console.log(`\n${title} (${arr.length}):`); arr.forEach(x => console.log('   ' + fmt(x))); return arr.length; };
+    let bad = 0;
+    // пара «состояние ↔ журнал» определяется ССЫЛКОЙ, а не совпадением имён:
+    // acme_log парный к project_acme, tracker_log — к desk_tracker
+    const paired = new Set();
+    for (const n of N) if (n.base.endsWith('_log') && n.in > 0) paired.add(n.base);
+    // 1) состояние разбухло
+    bad += say('Заметка-состояние разбухла (>15K токенов) — выкинь отработанное',
+      N.filter(n => !n.base.endsWith('_log') && n.size / 2.2 > 15000).sort((a, b) => b.size - a.size),
+      x => `${pad(label(x), 40)} ~${Math.round(x.size / 2200)}K токенов`);
+    // 2) в «состоянии» появились датированные заголовки — писали не туда
+    // 2) журнал, на который никто не ссылается — потеряется
+    bad += say('Журнал, на который никто не ссылается — из него нет обратной дороги',
+      N.filter(n => n.base.endsWith('_log') && !paired.has(n.base)), x => label(x));
+    // 4) забыта дата обновления
+    const nodate = N.filter(n => n.size > 1500 && !n.hasDate);
+    if (nodate.length) console.log(`\nБез строки «Последнее обновление»: ${nodate.length} заметок — непонятно, актуальны ли.\n   ${nodate.slice(0,6).map(label).join(', ')}${nodate.length>6?', …':''}\n   Список целиком: vault lint --dates`);
+    if (process.argv.includes('--dates')) nodate.forEach(x => console.log('   ' + label(x)));
+    if (!bad) console.log('Дисциплина соблюдена: разбухших состояний нет, записи лежат по местам, даты на месте.');
+    else console.log(`\nВсего замечаний: ${bad}.`);
+  },
+  async save(args) {
+    const { execFileSync } = require('child_process');
+    const script = path.join(__dirname, 'vault-commit');
+    try { process.stdout.write(execFileSync(script, args.length ? [args.join(' ')] : [], { encoding: 'utf8' }) || 'нечего сохранять (изменений нет)\n'); }
+    catch (e) { console.error('vault save:', e.message); process.exit(1); }
+  },
+  async open(args) {
+    let url = BASE + '/';
+    if (args[0]) { const n = await findNote(args[0]); url += '#/' + n.id; }
+    spawnSync('sh', ['-c', `setsid firefox "${url}" >/dev/null 2>&1 &`]);
+    console.log(url);
+  },
+  async path(args) { const n = await findNote(args[0] || ''); console.log(absPath(n)); },
+};
+function usage() {
+  console.log(require('fs').readFileSync(__filename, 'utf8').split('\n').filter(l => l.startsWith('//   ')).map(l => l.slice(5)).join('\n'));
+}
+Object.assign(cmds, require(path.join(LIB, 'cli-facts.js')));
+(async () => {
+  const [cmd, ...args] = process.argv.slice(2);
+  if (!cmd || !cmds[cmd]) return usage();
+  // факты, сверка и индекс работают с файлами напрямую — сервер им не нужен
+  if (!['fact', 'facts', 'verify', 'index'].includes(cmd)) await ensureUp();
+  try { await cmds[cmd](args); } catch (e) { console.error('vault:', e.message); process.exit(1); }
+})();

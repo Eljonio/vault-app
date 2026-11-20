@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# vault-commit — снимок памяти в git. Без него нарезка больших заметок — операция без страховки.
+#
+#   vault-commit                  обычный коммит (ничего не изменилось — молча выходит)
+#   vault-commit "текст"          коммит со своим сообщением
+#   vault-commit --before <файл>  снимок ПЕРЕД опасной правкой файла (вызывать до перезаписи)
+#
+# Репозиторий задуман ЛОКАЛЬНЫМ, без remote: в личных заметках может оказаться что угодно, включая учётные данные.
+# Удалённую копию заводить только после того, как секреты вынесены в менеджер секретов.
+set -u
+VAULT="${VAULT_DIR:-$HOME/claude-vault}"
+cd "$VAULT" 2>/dev/null || { echo "vault-commit: нет $VAULT" >&2; exit 1; }
+[ -d .git ] || { echo "vault-commit: git не заведён (git init в $VAULT)" >&2; exit 1; }
+
+# Страховка от утечки: если кто-то добавил remote — не коммитим молча, предупреждаем.
+if git remote | grep -q .; then
+  echo "⚠ vault-commit: у репозитория есть remote ($(git remote | tr '\n' ' '))." >&2
+  echo "  В заметках могут быть секреты — проверь, прежде чем пушить." >&2
+fi
+
+msg="${1:-}"
+if [ "${1:-}" = "--before" ]; then
+  msg="перед правкой ${2:-?}"
+fi
+
+git add -A
+git diff --cached --quiet && exit 0   # нечего коммитить
+
+files=$(git diff --cached --name-only | wc -l)
+stat=$(git diff --cached --shortstat | sed 's/^ //')
+[ -n "$msg" ] || msg="память: $files файл(ов) изменено"
+
+git commit -q -m "$msg" -m "$stat"
+echo "✓ снимок: $msg ($stat)"

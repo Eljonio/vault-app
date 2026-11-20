@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# vaultctl — запуск/остановка Vault-сервера с учётом нескольких сессий Claude Code.
+#   vaultctl start   [session_id]  — поднять (если не поднят), зарегистрировать сессию
+#   vaultctl stop    [session_id]  — снять сессию; если сессий не осталось — погасить сервер
+#   vaultctl hook-start / hook-stop — то же, но session_id берётся из JSON на stdin (хуки Claude Code)
+#   vaultctl kill                  — погасить принудительно
+#   vaultctl status
+#   vaultctl open                  — открыть в Firefox
+set -u
+APP_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"  # readlink: работает и через симлинк ~/bin/vaultctl
+RUN_DIR="${VAULT_RUN_DIR:-${XDG_RUNTIME_DIR:-/tmp}/vault-app}"
+PID_FILE="$RUN_DIR/server.pid"
+SESS_DIR="$RUN_DIR/sessions"
+LOG="$APP_DIR/server.log"
+PORT="${VAULT_PORT:-4040}"
+URL="http://127.0.0.1:$PORT"
+mkdir -p "$SESS_DIR"
+
+is_up() {
+  [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+}
+alive_on_port() { curl -sf -m 1 "$URL/api/rebuild" >/dev/null 2>&1; }
+
+# Ищем среди предков процесс claude — его PID пишем в маркер сессии,
+# чтобы сервер сам погас, если терминал закрыли жёстко и SessionEnd не отработал.
+find_claude_pid() {
+  local pid=$PPID i args
+  for i in 1 2 3 4 5 6 7 8; do
+    [[ -z "$pid" || "$pid" -le 1 ]] && return 1
+    args=$(ps -o args= -p "$pid" 2>/dev/null)
+    if printf '%s' "$args" | grep -qE '(^|/| )claude( |$)|claude-code|\.claude/local'; then echo "$pid"; return 0; fi
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+  done
+  return 1
+}
+
+case "${1:-status}" in
+  start)
+    sid="${2:-manual}"
+    [[ -f "$SESS_DIR/$sid" ]] || : >"$SESS_DIR/$sid"
+    # flock: несколько чатов стартуют одновременно → сервер всё равно один
+    (
+      flock 9
+      if is_up || alive_on_port; then
+        echo "vault: уже запущен ($URL), сессий: $(ls "$SESS_DIR" | wc -l)"
+        exit 0
+      fi
+      cd "$APP_DIR" || exit 1
+      VAULT_AUTOEXIT=1 nohup node server.js >>"$LOG" 2>&1 9>&- &
+      echo $! >"$PID_FILE"
+      # ждём готовности до 3 с
+      for _ in $(seq 1 15); do alive_on_port && break; sleep 0.2; done
+      echo "vault: запущен pid $(cat "$PID_FILE") → $URL"
+    ) 9>"$RUN_DIR/start.lock"
+    ;;
+  stop)
+    sid="${2:-manual}"
+    (
+      flock 9
+      rm -f "$SESS_DIR/$sid"
+      # чистим маркеры умерших сессий (старше 2 суток)
+      find "$SESS_DIR" -type f -mtime +2 -delete 2>/dev/null
+      left=$(ls "$SESS_DIR" | wc -l)
+      if (( left > 0 )); then
+        echo "vault: ещё $left сессий, сервер оставляю"
+        exit 0
+      fi
+      "$0" kill
+    ) 9>"$RUN_DIR/start.lock"
+    ;;
+  hook-start|hook-stop)
+    # Вызывается хуком Claude Code (SessionStart / SessionEnd): JSON с session_id на stdin.
+    input=$(cat 2>/dev/null || true)
+    sid=$(printf '%s' "$input" | sed -n 's/.*"session_id" *: *"\([^"]*\)".*/\1/p' | head -1)
+    [[ -z "$sid" ]] && sid="hook-$PPID"
+    if [[ "$1" == "hook-start" ]]; then
+      "$0" start "$sid" >/dev/null
+      # PID claude-предка; если его нет (CLI из обычного терминала) — PID вызывающего процесса:
+      # сервер живёт, пока жив он, и гаснет сам, когда некому им пользоваться
+      cpid=$(find_claude_pid || echo "$PPID")
+      echo "$cpid" >"$SESS_DIR/$sid"
+      # снимок памяти на входе: подберёт правки, сделанные вне Claude (Obsidian и т.п.)
+      [ -x "$APP_DIR/bin/vault-commit" ] && "$APP_DIR/bin/vault-commit" "память: правки вне сессии" >/dev/null 2>&1 || true
+      echo "$(date '+%F %T') hook-start sid=$sid claude_pid=${cpid:-?}" >>"$LOG"
+    else
+      echo "$(date '+%F %T') hook-stop sid=$sid" >>"$LOG"
+      # снимок памяти на выходе: всё, что Claude наработал за сессию
+      [ -x "$APP_DIR/bin/vault-commit" ] && "$APP_DIR/bin/vault-commit" "память: итог сессии $sid" >/dev/null 2>&1 || true
+      "$0" stop "$sid" >/dev/null
+      # закрылся последний чат — необязательная команда из окружения (например, запереть менеджер секретов)
+      if [[ -z "$(ls -A "$SESS_DIR" 2>/dev/null)" && -n "${VAULT_ON_LAST_EXIT:-}" ]]; then
+        sh -c "$VAULT_ON_LAST_EXIT" >/dev/null 2>&1 || true
+      fi
+    fi
+    exit 0
+    ;;
+  kill)
+    if is_up; then kill "$(cat "$PID_FILE")" 2>/dev/null; sleep 0.3; fi
+    # на случай осиротевшего процесса — по порту
+    pid_port=$(ss -ltnp 2>/dev/null | awk -v p=":$PORT" '$4 ~ p"$" {print $NF}' | grep -o 'pid=[0-9]*' | cut -d= -f2 | head -1)
+    [[ -n "${pid_port:-}" ]] && kill "$pid_port" 2>/dev/null
+    rm -f "$PID_FILE"
+    rm -f "$SESS_DIR"/*
+    echo "vault: остановлен"
+    ;;
+  status)
+    if alive_on_port; then
+      echo "vault: работает $URL (pid $(cat "$PID_FILE" 2>/dev/null || echo ?))"
+      for f in "$SESS_DIR"/*; do [[ -f "$f" ]] && echo "  сессия $(basename "$f") pid=$(cat "$f" 2>/dev/null || echo -)"; done
+    else echo "vault: не запущен"; fi
+    ;;
+  open)
+    "$0" start manual >/dev/null
+    (setsid firefox "$URL" >/dev/null 2>&1 &)
+    echo "$URL"
+    ;;
+  restart)
+    # перезапуск кода сервера БЕЗ потери маркеров сессий (kill их стирает и отвязывает живые чаты)
+    if is_up; then kill "$(cat "$PID_FILE")" 2>/dev/null; sleep 0.3; fi
+    pid_port=$(ss -ltnp 2>/dev/null | awk -v p=":$PORT" '$4 ~ p"$" {print $NF}' | grep -o 'pid=[0-9]*' | cut -d= -f2 | head -1)
+    [[ -n "${pid_port:-}" ]] && kill "$pid_port" 2>/dev/null
+    rm -f "$PID_FILE"
+    keep=$(ls -A "$SESS_DIR" 2>/dev/null | head -1)
+    "$0" start "${keep:-manual}"
+    ;;
+  *) echo "usage: vaultctl start|stop|restart|hook-start|hook-stop|kill|status|open [session_id]"; exit 1 ;;
+esac

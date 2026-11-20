@@ -1,0 +1,42 @@
+#!/usr/bin/env node
+// vault-recall — подкладка из памяти по фразе: 3–5 фактов и заметок-столов, ≤ 1 КБ, без сети и без LLM.
+//
+//   vault-recall "че по деплою"      печать подкладки (пусто — значит, ничего уверенного не нашлось)
+//   vault-recall --hook               для хука UserPromptSubmit: JSON {"prompt": …} на stdin; любые ошибки молча → exit 0
+//   vault-recall --why "фраза"        с очками и сработавшими понятиями (отладка словаря facts/synonyms.md)
+//   vault-recall --json "фраза"       машинный вывод
+'use strict';
+const path = require('path');
+const fs = require('fs');
+const lib = path.join(path.dirname(fs.realpathSync(__filename)), '..', 'lib');
+
+const args = process.argv.slice(2);
+const flag = f => { const i = args.indexOf(f); if (i >= 0) { args.splice(i, 1); return true; } return false; };
+const hook = flag('--hook'), why = flag('--why'), asJson = flag('--json');
+
+function main(text) {
+  const { recall, format } = require(path.join(lib, 'recall.js'));
+  text = String(text || '').trim();
+  if (!text || text.startsWith('/')) return;
+  const res = recall(text.slice(0, 600));
+  if (asJson) return console.log(JSON.stringify({ units: res.units, items: res.items.map(r => ({ kind: r.doc.kind, id: r.doc.id, score: +r.score.toFixed(2), why: r.why })) }));
+  if (why) {
+    console.log('понятия/слова: ' + res.units.join(' | '));
+    for (const r of res.items) console.log(`  ${r.score.toFixed(2).padStart(6)}  ${r.doc.kind === 'fact' ? 'факт   ' : 'заметка'} ${r.doc.id}  ← ${r.why.join(', ')}`);
+  }
+  const out = format(res);
+  if (out) console.log(out);
+}
+
+if (hook) {
+  let buf = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', c => { buf += c; });
+  process.stdin.on('end', () => {
+    try { let p = buf; try { p = JSON.parse(buf).prompt ?? ''; } catch {} main(p); } catch {}
+    process.exit(0);
+  });
+  process.stdin.on('error', () => process.exit(0));
+} else {
+  try { main(args.join(' ')); } catch (e) { console.error('vault-recall:', e.message); process.exit(1); }
+}
